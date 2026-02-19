@@ -4,10 +4,13 @@ import pandas as pd
 import re
 import io
 import traceback
+import json
 from pathlib import Path
 from PIL import Image
 from datetime import datetime
-
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+from google.oauth2.service_account import Credentials
 
 # ============================================================================
 # RUTAS E ICONO
@@ -17,15 +20,18 @@ DIR_DISENO = BASE_DIR / "diseño"
 ICONO_FILE = DIR_DISENO / "ada-icono (1).png"
 HEADER_MAIN_FILE = DIR_DISENO / "ADA-vc-color (1).jpg"
 
-# Session state
-if 'archivos_procesados' not in st.session_state:
-    st.session_state.archivos_procesados = None
-if 'comparacion_ejecutada' not in st.session_state:
-    st.session_state.comparacion_ejecutada = False
-if 'dataframes_procesados' not in st.session_state:
-    st.session_state.dataframes_procesados = None
-if 'info_archivos' not in st.session_state:
-    st.session_state.info_archivos = None
+# ============================================================================
+# SESSION STATE
+# ============================================================================
+for key, val in {
+    'archivos_procesados': None,
+    'comparacion_ejecutada': False,
+    'dataframes_procesados': None,
+    'info_archivos': None,
+    'revision_activa': None,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
 
 try:
     icono_pestana = Image.open(ICONO_FILE)
@@ -36,7 +42,7 @@ st.set_page_config(
     page_title="RPT - Gestor de Puestos",
     page_icon=icono_pestana,
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 # ============================================================================
@@ -95,7 +101,78 @@ except Exception:
     pass
 
 # ============================================================================
-# FUNCIONES DE EXTRACCIÓN
+# GOOGLE DRIVE - CONEXIÓN
+# ============================================================================
+CARPETA_RAIZ_NOMBRE = "RPT_Revisiones"
+
+@st.cache_resource
+def conectar_drive():
+    """Conecta con Google Drive usando las credenciales de Streamlit Secrets."""
+    try:
+        creds_dict = st.secrets["google_drive"]
+        creds = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        service = build("drive", "v3", credentials=creds)
+        return service
+    except Exception as e:
+        st.error(f"❌ Error conectando con Google Drive: {e}")
+        return None
+
+def obtener_o_crear_carpeta(service, nombre, parent_id=None):
+    """Obtiene una carpeta por nombre o la crea si no existe."""
+    query = f"name='{nombre}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    archivos = results.get("files", [])
+    if archivos:
+        return archivos[0]["id"]
+    # Crear carpeta
+    metadata = {
+        "name": nombre,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    if parent_id:
+        metadata["parents"] = [parent_id]
+    carpeta = service.files().create(body=metadata, fields="id").execute()
+    return carpeta["id"]
+
+def listar_revisiones(service, carpeta_raiz_id):
+    """Lista todas las subcarpetas (revisiones) dentro de la carpeta raíz."""
+    query = f"'{carpeta_raiz_id}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    results = service.files().list(q=query, fields="files(id, name, createdTime)", orderBy="createdTime desc").execute()
+    return results.get("files", [])
+
+def listar_pdfs_revision(service, carpeta_id):
+    """Lista los PDFs dentro de una carpeta de revisión."""
+    query = f"'{carpeta_id}' in parents and mimeType='application/pdf' and trashed=false"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    return results.get("files", [])
+
+def subir_pdf_drive(service, nombre_archivo, bytes_pdf, carpeta_id):
+    """Sube un PDF a Google Drive en la carpeta indicada."""
+    metadata = {"name": nombre_archivo, "parents": [carpeta_id]}
+    media = MediaIoBaseUpload(io.BytesIO(bytes_pdf), mimetype="application/pdf")
+    service.files().create(body=metadata, media_body=media, fields="id").execute()
+
+def descargar_pdf_drive(service, file_id):
+    """Descarga un PDF de Google Drive y devuelve sus bytes."""
+    request = service.files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue()
+
+def eliminar_carpeta_drive(service, carpeta_id):
+    """Elimina una carpeta y su contenido de Google Drive."""
+    service.files().delete(fileId=carpeta_id).execute()
+
+# ============================================================================
+# FUNCIONES DE EXTRACCIÓN (igual que antes)
 # ============================================================================
 
 def es_linea_plaza(linea):
@@ -149,15 +226,11 @@ def extraer_nombre_persona(linea):
     return None
 
 def extraer_formacion(linea):
-    """Extrae DEFINITIVO o PROVISIONAL de la línea de persona."""
-    if 'PROVISIONAL' in linea.upper():
-        return 'PROVISIONAL'
-    elif 'DEFINITIVO' in linea.upper():
-        return 'DEFINITIVO'
+    if 'PROVISIONAL' in linea.upper(): return 'PROVISIONAL'
+    elif 'DEFINITIVO' in linea.upper(): return 'DEFINITIVO'
     return None
 
 def extraer_dni(linea):
-    """Extrae el DNI/NIE del funcionario (formato: 12345678A al inicio del código)."""
     match = re.search(r'(\d{8}[A-Z])', linea)
     return match.group(1) if match else None
 
@@ -176,7 +249,6 @@ def extraer_dotacion(linea):
     if len(partes) > 2 and (partes[-1] == 'N' or partes[-2] == 'N'): return "NO DOTADA"
     return "DOTADA"
 
-
 def extraer_fecha_pdf(archivo_bytes, nombre_archivo):
     try:
         with pdfplumber.open(io.BytesIO(archivo_bytes)) as pdf:
@@ -187,21 +259,17 @@ def extraer_fecha_pdf(archivo_bytes, nombre_archivo):
                         if 'Fecha' in linea or 'fecha' in linea:
                             match = re.search(r'(\d{2}/\d{2}/\d{4})', linea)
                             if match:
-                                fecha = match.group(1)
-                                return fecha
+                                return match.group(1)
     except Exception:
         pass
     return None
 
-
 def procesar_pdf(archivo_bytes, nombre_archivo):
     registros = []
-
     try:
         buffer = io.BytesIO(archivo_bytes)
         with pdfplumber.open(buffer) as pdf:
             num_paginas = len(pdf.pages)
-
             todas_lineas = []
             paginas_sin_texto = []
 
@@ -210,21 +278,15 @@ def procesar_pdf(archivo_bytes, nombre_archivo):
                     try:
                         texto = pagina.extract_text()
                         if texto:
-                            lineas = texto.split('\n')
-                            todas_lineas.extend(lineas)
+                            todas_lineas.extend(texto.split('\n'))
                         else:
                             paginas_sin_texto.append(num_pag)
-                    except Exception as e:
-                        tb = traceback.format_exc()
+                    except Exception:
+                        pass
 
                 if paginas_sin_texto:
-                    st.warning(f"⚠️ {len(paginas_sin_texto)} páginas sin texto en {nombre_archivo} (págs: {paginas_sin_texto[:10]})")
-
+                    st.warning(f"⚠️ {len(paginas_sin_texto)} páginas sin texto en {nombre_archivo}")
                 st.info(f"✅ {nombre_archivo}: {len(todas_lineas):,} líneas extraídas de {num_paginas} páginas")
-
-            # Parsear líneas
-            plazas_detectadas = 0
-            plazas_sin_codigo = 0
 
             i = 0
             while i < len(todas_lineas):
@@ -232,11 +294,9 @@ def procesar_pdf(archivo_bytes, nombre_archivo):
                 if es_linea_plaza(linea):
                     codigo = extraer_codigo_puesto(linea)
                     if not codigo:
-                        plazas_sin_codigo += 1
                         i += 1
                         continue
 
-                    plazas_detectadas += 1
                     nombre_ocupante = None
                     dni_ocupante = None
                     formacion_ocupante = None
@@ -250,8 +310,6 @@ def procesar_pdf(archivo_bytes, nombre_archivo):
                                 nombre_ocupante = extraer_nombre_persona(sig)
                                 dni_ocupante = extraer_dni(sig)
                                 formacion_ocupante = extraer_formacion(sig)
-                                if not nombre_ocupante:
-                                    pass
                                 break
                             if es_linea_plaza(sig): break
 
@@ -264,59 +322,33 @@ def procesar_pdf(archivo_bytes, nombre_archivo):
                         'Dotación':     extraer_dotacion(linea),
                         'Ocupante':     nombre_ocupante if nombre_ocupante else 'VACANTE',
                         'Estado_Plaza': 'OCUPADA' if nombre_ocupante else 'LIBRE',
-                        'DNI':          dni_ocupante,  # campo interno
-                        'Formacion':    formacion_ocupante  # campo interno
+                        'DNI':          dni_ocupante,
+                        'Formacion':    formacion_ocupante
                     })
                 i += 1
 
-
         df_resultado = pd.DataFrame(registros)
-
         if df_resultado.empty:
             st.error(f"❌ {nombre_archivo}: no se extrajeron plazas.")
             return pd.DataFrame()
 
-        # ─────────────────────────────────────────────────────────────────────────
-        # PERSONAS CON PLAZA PROVISIONAL Y DEFINITIVA SIMULTÁNEA
-        # → Plaza PROVISIONAL: OCUPADA con el nombre del funcionario
-        # → Plaza DEFINITIVO:  LIBRE (el funcionario está en la provisional)
-        #                        pero se conserva el nombre entre paréntesis
-        #                        para saber quién la tenía asignada.
-        # ─────────────────────────────────────────────────────────────────────────
+        # Gestión provisional/definitivo
         df_ocupadas = df_resultado[df_resultado['Estado_Plaza'] == 'OCUPADA'].copy()
-
         if not df_ocupadas.empty and 'DNI' in df_ocupadas.columns:
             df_ocupadas['_clave_persona'] = df_ocupadas['DNI'].fillna('') + '|' + df_ocupadas['Ocupante']
             duplicados = df_ocupadas[df_ocupadas.duplicated(subset=['_clave_persona'], keep=False)]
-
             if not duplicados.empty:
-                personas_duplicadas = duplicados['_clave_persona'].unique()
-                codigos_liberados = []
-
-                for persona in personas_duplicadas:
-                    if '|' not in persona or persona.startswith('|'):
-                        continue
-
+                for persona in duplicados['_clave_persona'].unique():
+                    if '|' not in persona or persona.startswith('|'): continue
                     registros_persona = df_ocupadas[df_ocupadas['_clave_persona'] == persona]
-
-                    # Solo actuar si tiene al menos una plaza PROVISIONAL
                     if 'PROVISIONAL' in registros_persona['Formacion'].values:
                         definitivos = registros_persona[registros_persona['Formacion'] == 'DEFINITIVO']
                         nombre_func = persona.split('|', 1)[1]
-
                         for codigo in definitivos['Código'].tolist():
-                            # Marcar como LIBRE (el funcionario está en su provisional)
                             df_resultado.loc[df_resultado['Código'] == codigo, 'Estado_Plaza'] = 'LIBRE'
-                            # Conservar el nombre entre paréntesis como referencia
                             df_resultado.loc[df_resultado['Código'] == codigo, 'Ocupante'] = f'({nombre_func})'
-                            codigos_liberados.append(codigo)
 
-                if codigos_liberados:
-                    st.info(f"ℹ️ {nombre_archivo}: {len(codigos_liberados)} plaza(s) DEFINITIVA(S) marcadas como LIBRE porque el ocupante está en plaza PROVISIONAL. El nombre aparece entre paréntesis como referencia.")
-        
-        antes = len(df_resultado)
         df_resultado = df_resultado.drop_duplicates(subset=['Código'])
-
         st.success(f"✅ {nombre_archivo}: {len(df_resultado):,} plazas únicas procesadas")
         return df_resultado
 
@@ -326,7 +358,6 @@ def procesar_pdf(archivo_bytes, nombre_archivo):
         with st.expander("🔍 Ver detalles técnicos"):
             st.code(tb)
         return pd.DataFrame()
-
 
 def ordenar_archivos_por_fecha(archivos_lista):
     archivos_con_fecha = []
@@ -340,11 +371,58 @@ def ordenar_archivos_por_fecha(archivos_lista):
                 archivos_con_fecha.append((nombre, archivo_bytes, datetime.min, fecha_str))
         else:
             archivos_con_fecha.append((nombre, archivo_bytes, datetime.min, "Sin fecha"))
-
     archivos_con_fecha.sort(key=lambda x: x[2])
-    orden = [(n, b, f) for n, b, _, f in archivos_con_fecha]
-    return orden
+    return [(n, b, f) for n, b, _, f in archivos_con_fecha]
 
+# ============================================================================
+# SIDEBAR - REVISIONES GUARDADAS
+# ============================================================================
+service = conectar_drive()
+
+with st.sidebar:
+    st.markdown("## 📁 Revisiones Guardadas")
+
+    if service:
+        carpeta_raiz_id = obtener_o_crear_carpeta(service, CARPETA_RAIZ_NOMBRE)
+        revisiones = listar_revisiones(service, carpeta_raiz_id)
+
+        if not revisiones:
+            st.info("No hay revisiones guardadas aún.")
+        else:
+            for rev in revisiones:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    if st.button(f"📂 {rev['name']}", key=f"rev_{rev['id']}"):
+                        # Cargar PDFs de esta revisión
+                        with st.spinner(f"Cargando {rev['name']}..."):
+                            pdfs = listar_pdfs_revision(service, rev['id'])
+                            if len(pdfs) >= 2:
+                                archivos_lista = []
+                                for pdf in pdfs:
+                                    bytes_pdf = descargar_pdf_drive(service, pdf['id'])
+                                    archivos_lista.append((pdf['name'], bytes_pdf))
+                                st.session_state.archivos_procesados = archivos_lista
+                                st.session_state.comparacion_ejecutada = True
+                                st.session_state.dataframes_procesados = None
+                                st.session_state.info_archivos = None
+                                st.session_state.revision_activa = rev['name']
+                                st.rerun()
+                            else:
+                                st.warning("Esta revisión necesita al menos 2 PDFs.")
+                with col2:
+                    if st.button("🗑️", key=f"del_{rev['id']}", help="Eliminar revisión"):
+                        eliminar_carpeta_drive(service, rev['id'])
+                        st.success(f"Revisión '{rev['name']}' eliminada.")
+                        st.rerun()
+
+    st.markdown("---")
+    if st.button("🔄 Nueva Comparación"):
+        st.session_state.archivos_procesados = None
+        st.session_state.comparacion_ejecutada = False
+        st.session_state.dataframes_procesados = None
+        st.session_state.info_archivos = None
+        st.session_state.revision_activa = None
+        st.rerun()
 
 # ============================================================================
 # PANTALLA DE CARGA
@@ -360,6 +438,15 @@ if not st.session_state.comparacion_ejecutada:
     """, unsafe_allow_html=True)
 
     st.markdown("---")
+
+    # NOMBRE DE LA REVISIÓN
+    st.markdown("### 📝 Nombre de la Revisión")
+    nombre_revision = st.text_input(
+        "Ponle un nombre a esta revisión",
+        placeholder="Ej: Revisión Marzo-Febrero 2026",
+        label_visibility="collapsed"
+    )
+
     st.markdown("### 📁 Cargar Archivos PDF")
     st.info("💡 **Tip:** Los archivos se ordenarán automáticamente por fecha para mostrar la evolución cronológica")
 
@@ -380,41 +467,52 @@ if not st.session_state.comparacion_ejecutada:
 
         col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
         with col_btn2:
-            if st.button("🔍 Comparar Todos los Archivos", type="primary", use_container_width=True):
+            if st.button("🔍 Comparar y Guardar", type="primary", use_container_width=True):
 
-                # Lista de tuplas (nombre_unico, bytes) para soportar nombres duplicados
+                if not nombre_revision.strip():
+                    st.error("❌ Escribe un nombre para la revisión antes de continuar.")
+                    st.stop()
+
                 archivos_lista = []
-                errores_lectura = []
                 nombres_vistos = {}
 
                 for archivo in archivos_subidos:
                     try:
                         contenido_bytes = archivo.read()
                         if len(contenido_bytes) == 0:
-                            errores_lectura.append(f"Archivo vacío: {archivo.name}")
-                        else:
-                            # Si el nombre ya existe, añadir sufijo _2, _3, etc.
-                            nombre_base = archivo.name
-                            if nombre_base in nombres_vistos:
-                                nombres_vistos[nombre_base] += 1
-                                ext_idx = nombre_base.rfind('.')
-                                if ext_idx > 0:
-                                    nombre_unico = nombre_base[:ext_idx] + f"_{nombres_vistos[nombre_base]}" + nombre_base[ext_idx:]
-                                else:
-                                    nombre_unico = nombre_base + f"_{nombres_vistos[nombre_base]}"
+                            st.warning(f"Archivo vacío: {archivo.name}")
+                            continue
+                        nombre_base = archivo.name
+                        if nombre_base in nombres_vistos:
+                            nombres_vistos[nombre_base] += 1
+                            ext_idx = nombre_base.rfind('.')
+                            if ext_idx > 0:
+                                nombre_unico = nombre_base[:ext_idx] + f"_{nombres_vistos[nombre_base]}" + nombre_base[ext_idx:]
                             else:
-                                nombres_vistos[nombre_base] = 1
-                                nombre_unico = nombre_base
-                            archivos_lista.append((nombre_unico, contenido_bytes))
+                                nombre_unico = nombre_base + f"_{nombres_vistos[nombre_base]}"
+                        else:
+                            nombres_vistos[nombre_base] = 1
+                            nombre_unico = nombre_base
+                        archivos_lista.append((nombre_unico, contenido_bytes))
                     except Exception as e:
-                        errores_lectura.append(f"Error leyendo {archivo.name}: {e}")
-
-                for err in errores_lectura:
-                    st.warning(err)
+                        st.warning(f"Error leyendo {archivo.name}: {e}")
 
                 if len(archivos_lista) >= 2:
+                    # Guardar en Google Drive
+                    if service:
+                        with st.spinner("💾 Guardando revisión en Google Drive..."):
+                            try:
+                                carpeta_raiz_id = obtener_o_crear_carpeta(service, CARPETA_RAIZ_NOMBRE)
+                                carpeta_rev_id = obtener_o_crear_carpeta(service, nombre_revision.strip(), carpeta_raiz_id)
+                                for nombre_arch, bytes_pdf in archivos_lista:
+                                    subir_pdf_drive(service, nombre_arch, bytes_pdf, carpeta_rev_id)
+                                st.success(f"✅ Revisión '{nombre_revision}' guardada en Google Drive")
+                            except Exception as e:
+                                st.warning(f"⚠️ No se pudo guardar en Drive: {e}")
+
                     st.session_state.archivos_procesados = archivos_lista
                     st.session_state.comparacion_ejecutada = True
+                    st.session_state.revision_activa = nombre_revision.strip()
                     st.rerun()
                 else:
                     st.error(f"❌ Solo {len(archivos_lista)} archivo(s) válido(s). Se necesitan al menos 2.")
@@ -430,11 +528,13 @@ if not st.session_state.comparacion_ejecutada:
 # ============================================================================
 if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesados:
 
-    st.title("RPT: Comparación Múltiple de Archivos")
+    if st.session_state.revision_activa:
+        st.title(f"📂 {st.session_state.revision_activa}")
+    else:
+        st.title("RPT: Comparación Múltiple de Archivos")
     st.markdown("---")
 
     if st.session_state.dataframes_procesados is None:
-
         with st.spinner('🔄 Procesando y ordenando archivos cronológicamente...'):
             archivos_ordenados = ordenar_archivos_por_fecha(st.session_state.archivos_procesados)
             dataframes_procesados = []
@@ -444,9 +544,7 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
 
             for i, (nombre, archivo_bytes, fecha) in enumerate(archivos_ordenados):
                 st.markdown(f"**Procesando archivo {i+1}/{len(archivos_ordenados)}:** {nombre}")
-
                 df = procesar_pdf(archivo_bytes, nombre)
-
                 if not df.empty:
                     dataframes_procesados.append(df)
                     info_archivos.append({
@@ -465,14 +563,12 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
 
         st.session_state.dataframes_procesados = dataframes_procesados
         st.session_state.info_archivos = info_archivos
-
     else:
         dataframes_procesados = st.session_state.dataframes_procesados
         info_archivos = st.session_state.info_archivos
 
     if len(dataframes_procesados) >= 2:
 
-        # Resumen general
         st.markdown("### 📊 Resumen General")
         total_plazas_base  = len(dataframes_procesados[0])
         total_plazas_final = len(dataframes_procesados[-1])
@@ -484,7 +580,6 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
         col3.metric("Total de Versiones", len(dataframes_procesados))
         st.markdown("---")
 
-        # Comparaciones entre versiones
         st.markdown("## 🔀 Comparaciones Detalladas Entre Versiones")
 
         nombres_comparaciones = []
@@ -522,17 +617,17 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
                     if cambio_ocu:  return '🔄 CAMBIO OCUPANTE'
                     return '✅ SIN CAMBIOS'
 
-                df_comp['Situación']          = df_comp.apply(det_estado_comp, axis=1)
-                df_comp['Denominación']       = df_comp['Denominación_ACT'].fillna(df_comp['Denominación_ANT'])
-                df_comp['Grupo']              = df_comp['Grupo_ACT'].fillna(df_comp['Grupo_ANT'])
-                df_comp['Cuerpo']             = df_comp['Cuerpo_ACT'].fillna(df_comp['Cuerpo_ANT'])
-                df_comp['Provincia']          = df_comp['Provincia_ACT'].fillna(df_comp['Provincia_ANT'])
-                df_comp['Ocupante Anterior']  = df_comp['Ocupante_ANT'].fillna('-')
-                df_comp['Ocupante Actual']    = df_comp['Ocupante_ACT'].fillna('-')
-                df_comp['Dotación Anterior']  = df_comp['Dotación_ANT'].fillna('-')
-                df_comp['Dotación Actual']    = df_comp['Dotación_ACT'].fillna('-')
-                df_comp['Dotación'] = df_comp['Dotación_ACT'].fillna(df_comp['Dotación_ANT'])
-                df_comp['Estado']   = df_comp['Estado_Plaza_ACT'].fillna(df_comp['Estado_Plaza_ANT'])
+                df_comp['Situación']         = df_comp.apply(det_estado_comp, axis=1)
+                df_comp['Denominación']      = df_comp['Denominación_ACT'].fillna(df_comp['Denominación_ANT'])
+                df_comp['Grupo']             = df_comp['Grupo_ACT'].fillna(df_comp['Grupo_ANT'])
+                df_comp['Cuerpo']            = df_comp['Cuerpo_ACT'].fillna(df_comp['Cuerpo_ANT'])
+                df_comp['Provincia']         = df_comp['Provincia_ACT'].fillna(df_comp['Provincia_ANT'])
+                df_comp['Ocupante Anterior'] = df_comp['Ocupante_ANT'].fillna('-')
+                df_comp['Ocupante Actual']   = df_comp['Ocupante_ACT'].fillna('-')
+                df_comp['Dotación Anterior'] = df_comp['Dotación_ANT'].fillna('-')
+                df_comp['Dotación Actual']   = df_comp['Dotación_ACT'].fillna('-')
+                df_comp['Dotación']          = df_comp['Dotación_ACT'].fillna(df_comp['Dotación_ANT'])
+                df_comp['Estado']            = df_comp['Estado_Plaza_ACT'].fillna(df_comp['Estado_Plaza_ANT'])
 
                 nuevas        = len(df_comp[df_comp['Situación'] == '🆕 NUEVA'])
                 eliminadas    = len(df_comp[df_comp['Situación'] == '❌ ELIMINADA'])
@@ -541,56 +636,30 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
                 cambios_ambos = len(df_comp[df_comp['Situación'] == '🔄 CAMBIO OCUPANTE + DOTACIÓN'])
 
                 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-                col_m1.metric("🆕 Nuevas",         nuevas,        delta=f"+{nuevas}")
-                col_m2.metric("❌ Eliminadas",      eliminadas,    delta=f"-{eliminadas}")
+                col_m1.metric("🆕 Nuevas",         nuevas,     delta=f"+{nuevas}")
+                col_m2.metric("❌ Eliminadas",      eliminadas, delta=f"-{eliminadas}")
                 col_m3.metric("🔄 Cambio Ocupante", cambios_ocu)
                 col_m4.metric("💰 Cambio Dotación", cambios_dot)
                 col_m5.metric("🔄+💰 Ambos",        cambios_ambos)
                 st.markdown("---")
 
-                # ── Filtros de la comparación ─────────────────────────────
                 st.markdown("#### 🔎 Filtros")
                 cf1, cf2, cf3, cf4 = st.columns(4)
-
                 with cf1:
-                    opciones_prov = sorted(df_comp['Provincia'].dropna().unique())
-                    comp_filtro_prov = st.multiselect(
-                        "Provincia",
-                        options=opciones_prov,
-                        key=f"comp_prov_{idx}"
-                    )
+                    comp_filtro_prov = st.multiselect("Provincia", options=sorted(df_comp['Provincia'].dropna().unique()), key=f"comp_prov_{idx}")
                 with cf2:
-                    opciones_grupo = sorted([g for g in df_comp['Grupo'].dropna().unique()])
-                    comp_filtro_grupo = st.multiselect(
-                        "Grupo",
-                        options=opciones_grupo,
-                        key=f"comp_grupo_{idx}"
-                    )
+                    comp_filtro_grupo = st.multiselect("Grupo", options=sorted([g for g in df_comp['Grupo'].dropna().unique()]), key=f"comp_grupo_{idx}")
                 with cf3:
-                    comp_filtro_dot = st.multiselect(
-                        "Dotación",
-                        options=sorted(df_comp['Dotación'].dropna().unique()),
-                        key=f"comp_dot_{idx}"
-                    )
+                    comp_filtro_dot = st.multiselect("Dotación", options=sorted(df_comp['Dotación'].dropna().unique()), key=f"comp_dot_{idx}")
                 with cf4:
-                    comp_filtro_estado = st.multiselect(
-                        "Estado Plaza",
-                        options=sorted(df_comp['Estado'].dropna().unique()),
-                        key=f"comp_estado_{idx}"
-                    )
+                    comp_filtro_estado = st.multiselect("Estado Plaza", options=sorted(df_comp['Estado'].dropna().unique()), key=f"comp_estado_{idx}")
 
-                # Aplicar filtros al df_comp
                 df_comp_filtrado = df_comp.copy()
-                if comp_filtro_prov:
-                    df_comp_filtrado = df_comp_filtrado[df_comp_filtrado['Provincia'].isin(comp_filtro_prov)]
-                if comp_filtro_grupo:
-                    df_comp_filtrado = df_comp_filtrado[df_comp_filtrado['Grupo'].isin(comp_filtro_grupo)]
-                if comp_filtro_dot:
-                    df_comp_filtrado = df_comp_filtrado[df_comp_filtrado['Dotación'].isin(comp_filtro_dot)]
-                if comp_filtro_estado:
-                    df_comp_filtrado = df_comp_filtrado[df_comp_filtrado['Estado'].isin(comp_filtro_estado)]
+                if comp_filtro_prov:   df_comp_filtrado = df_comp_filtrado[df_comp_filtrado['Provincia'].isin(comp_filtro_prov)]
+                if comp_filtro_grupo:  df_comp_filtrado = df_comp_filtrado[df_comp_filtrado['Grupo'].isin(comp_filtro_grupo)]
+                if comp_filtro_dot:    df_comp_filtrado = df_comp_filtrado[df_comp_filtrado['Dotación'].isin(comp_filtro_dot)]
+                if comp_filtro_estado: df_comp_filtrado = df_comp_filtrado[df_comp_filtrado['Estado'].isin(comp_filtro_estado)]
 
-                # Recalcular métricas con filtro aplicado
                 nuevas_f      = len(df_comp_filtrado[df_comp_filtrado['Situación'] == '🆕 NUEVA'])
                 eliminadas_f  = len(df_comp_filtrado[df_comp_filtrado['Situación'] == '❌ ELIMINADA'])
                 cambios_ocu_f = len(df_comp_filtrado[df_comp_filtrado['Situación'] == '🔄 CAMBIO OCUPANTE'])
@@ -605,34 +674,20 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
 
                 st.markdown("---")
 
-                # ── Nombre corto para las pestañas de los PDFs ───────────────
+                MAX_TAB = 20
                 nombre_ant_corto = info_archivos[idx]['nombre']
                 nombre_act_corto = info_archivos[idx+1]['nombre']
-                # Recortar si es muy largo para que quepan bien en la tab
-                MAX_TAB = 20
                 tab_ant = (f"📄 {nombre_ant_corto[:MAX_TAB]}..." if len(nombre_ant_corto) > MAX_TAB else f"📄 {nombre_ant_corto}")
                 tab_act = (f"📄 {nombre_act_corto[:MAX_TAB]}..." if len(nombre_act_corto) > MAX_TAB else f"📄 {nombre_act_corto}")
 
-                # ── 6 pestañas unificadas ─────────────────────────────────────
-                # Las 4 de comparación + las 2 tablas individuales de cada PDF
                 (
-                    sub_tab_todos,
-                    sub_tab_nuevas,
-                    sub_tab_eliminadas,
-                    sub_tab_cambios,
-                    sub_tab_dot,
-                    sub_tab_ambos,
-                    sub_tab_pdf_ant,
-                    sub_tab_pdf_act,
+                    sub_tab_todos, sub_tab_nuevas, sub_tab_eliminadas,
+                    sub_tab_cambios, sub_tab_dot, sub_tab_ambos,
+                    sub_tab_pdf_ant, sub_tab_pdf_act,
                 ) = st.tabs([
-                    "🔍 TODOS",
-                    "🆕 Nuevas",
-                    "❌ Eliminadas",
-                    "🔄 Cambio Ocupante",
-                    "💰 Cambio Dotación",
-                    "🔄+💰 Ambos",
-                    tab_ant,
-                    tab_act,
+                    "🔍 TODOS", "🆕 Nuevas", "❌ Eliminadas",
+                    "🔄 Cambio Ocupante", "💰 Cambio Dotación", "🔄+💰 Ambos",
+                    tab_ant, tab_act,
                 ])
 
                 cols_mostrar = [
@@ -642,19 +697,16 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
                 ]
 
                 def color_rows(val):
-                    if val == '❌ ELIMINADA':                      return 'background-color: #ffebee'
-                    elif val == '🆕 NUEVA':                        return 'background-color: #e8f5e9'
-                    elif val == '🔄 CAMBIO OCUPANTE':              return 'background-color: #fffde7'
-                    elif val == '💰 CAMBIO DOTACIÓN':              return 'background-color: #e3f2fd'
-                    elif val == '🔄 CAMBIO OCUPANTE + DOTACIÓN':   return 'background-color: #f3e5f5'
-                    elif val == '✅ SIN CAMBIOS':                  return 'background-color: #f1f8f4'
+                    if val == '❌ ELIMINADA':                    return 'background-color: #ffebee'
+                    elif val == '🆕 NUEVA':                      return 'background-color: #e8f5e9'
+                    elif val == '🔄 CAMBIO OCUPANTE':            return 'background-color: #fffde7'
+                    elif val == '💰 CAMBIO DOTACIÓN':            return 'background-color: #e3f2fd'
+                    elif val == '🔄 CAMBIO OCUPANTE + DOTACIÓN': return 'background-color: #f3e5f5'
+                    elif val == '✅ SIN CAMBIOS':                return 'background-color: #f1f8f4'
                     return 'background-color: white'
 
                 with sub_tab_todos:
-                    st.dataframe(
-                        df_comp_filtrado[cols_mostrar].style.map(color_rows, subset=['Situación']),
-                        width='stretch', height=500
-                    )
+                    st.dataframe(df_comp_filtrado[cols_mostrar].style.map(color_rows, subset=['Situación']), width='stretch', height=500)
                     st.caption(f"Total: {len(df_comp_filtrado)} plazas")
 
                 with sub_tab_nuevas:
@@ -682,19 +734,15 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
                     st.dataframe(df_ab[cols_mostrar], width='stretch', height=500)
                     st.caption(f"Total: {len(df_ab)} plazas con cambio de ocupante y dotación")
 
-                # ── Tab PDF ANTERIOR (tabla individual) ───────────────────────
                 with sub_tab_pdf_ant:
                     st.markdown(f"#### {info_archivos[idx]['nombre']}")
                     st.caption(f"📅 Fecha: {info_archivos[idx]['fecha']}")
-
                     col_a, col_b, col_c, col_d = st.columns(4)
                     col_a.metric("Total Plazas", info_archivos[idx]['total_plazas'])
                     col_b.metric("Ocupadas",     info_archivos[idx]['ocupadas'])
                     col_c.metric("Libres",       info_archivos[idx]['libres'])
                     col_d.metric("Dotadas",      info_archivos[idx]['dotadas'])
-
                     st.markdown("---")
-
                     cf1, cf2, cf3, cf4 = st.columns(4)
                     with cf1:
                         f_prov = st.multiselect("Provincia", options=sorted(df_old['Provincia'].unique()), key=f"pdf1_prov_{idx}")
@@ -704,32 +752,23 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
                         f_dot = st.multiselect("Dotación", options=df_old['Dotación'].unique(), key=f"pdf1_dot_{idx}")
                     with cf4:
                         f_est = st.multiselect("Estado", options=df_old['Estado_Plaza'].unique(), key=f"pdf1_est_{idx}")
-
                     df_f = df_old.copy()
                     if f_prov:  df_f = df_f[df_f['Provincia'].isin(f_prov)]
                     if f_grupo: df_f = df_f[df_f['Grupo'].isin(f_grupo)]
                     if f_dot:   df_f = df_f[df_f['Dotación'].isin(f_dot)]
                     if f_est:   df_f = df_f[df_f['Estado_Plaza'].isin(f_est)]
-
-                    st.dataframe(
-                        df_f[['Código','Denominación','Grupo','Cuerpo','Provincia','Dotación','Estado_Plaza','Ocupante']],
-                        width='stretch', height=500
-                    )
+                    st.dataframe(df_f[['Código','Denominación','Grupo','Cuerpo','Provincia','Dotación','Estado_Plaza','Ocupante']], width='stretch', height=500)
                     st.caption(f"Mostrando {len(df_f)} de {len(df_old)} plazas")
 
-                # ── Tab PDF ACTUAL (tabla individual) ─────────────────────────
                 with sub_tab_pdf_act:
                     st.markdown(f"#### {info_archivos[idx+1]['nombre']}")
                     st.caption(f"📅 Fecha: {info_archivos[idx+1]['fecha']}")
-
                     col_a, col_b, col_c, col_d = st.columns(4)
                     col_a.metric("Total Plazas", info_archivos[idx+1]['total_plazas'])
                     col_b.metric("Ocupadas",     info_archivos[idx+1]['ocupadas'])
                     col_c.metric("Libres",       info_archivos[idx+1]['libres'])
                     col_d.metric("Dotadas",      info_archivos[idx+1]['dotadas'])
-
                     st.markdown("---")
-
                     cf1, cf2, cf3, cf4 = st.columns(4)
                     with cf1:
                         f_prov = st.multiselect("Provincia", options=sorted(df_new['Provincia'].unique()), key=f"pdf2_prov_{idx}")
@@ -739,17 +778,12 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
                         f_dot = st.multiselect("Dotación", options=df_new['Dotación'].unique(), key=f"pdf2_dot_{idx}")
                     with cf4:
                         f_est = st.multiselect("Estado", options=df_new['Estado_Plaza'].unique(), key=f"pdf2_est_{idx}")
-
                     df_f = df_new.copy()
                     if f_prov:  df_f = df_f[df_f['Provincia'].isin(f_prov)]
                     if f_grupo: df_f = df_f[df_f['Grupo'].isin(f_grupo)]
                     if f_dot:   df_f = df_f[df_f['Dotación'].isin(f_dot)]
                     if f_est:   df_f = df_f[df_f['Estado_Plaza'].isin(f_est)]
-
-                    st.dataframe(
-                        df_f[['Código','Denominación','Grupo','Cuerpo','Provincia','Dotación','Estado_Plaza','Ocupante']],
-                        width='stretch', height=500
-                    )
+                    st.dataframe(df_f[['Código','Denominación','Grupo','Cuerpo','Provincia','Dotación','Estado_Plaza','Ocupante']], width='stretch', height=500)
                     st.caption(f"Mostrando {len(df_f)} de {len(df_new)} plazas")
 
         st.markdown("---")
@@ -758,14 +792,15 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
             st.session_state.comparacion_ejecutada = False
             st.session_state.dataframes_procesados = None
             st.session_state.info_archivos = None
+            st.session_state.revision_activa = None
             st.rerun()
 
     else:
         st.error("⚠️ No se pudieron procesar suficientes archivos para realizar la comparación")
-        st.info("💡 Se necesitan al menos 2 archivos válidos. Revisa el 🪵 Panel de Logs en la barra lateral izquierda.")
         if st.button("🔄 Volver a cargar archivos"):
             st.session_state.archivos_procesados = None
             st.session_state.comparacion_ejecutada = False
             st.session_state.dataframes_procesados = None
             st.session_state.info_archivos = None
+            st.session_state.revision_activa = None
             st.rerun()
