@@ -90,7 +90,7 @@ st.markdown("""
 # --- Banner ---
 try:
     if HEADER_MAIN_FILE.exists():
-        st.image(str(HEADER_MAIN_FILE), use_container_width=True)
+        st.image(str(HEADER_MAIN_FILE), width='stretch')
 except Exception:
     pass
 
@@ -653,33 +653,33 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
                 with sub_tab_todos:
                     st.dataframe(
                         df_comp_filtrado[cols_mostrar].style.map(color_rows, subset=['Situación']),
-                        use_container_width=True, height=500
+                        width='stretch', height=500
                     )
                     st.caption(f"Total: {len(df_comp_filtrado)} plazas")
 
                 with sub_tab_nuevas:
                     df_n = df_comp_filtrado[df_comp_filtrado['Situación'] == '🆕 NUEVA']
-                    st.dataframe(df_n[cols_mostrar], use_container_width=True, height=500)
+                    st.dataframe(df_n[cols_mostrar], width='stretch', height=500)
                     st.caption(f"Total: {len(df_n)} plazas nuevas")
 
                 with sub_tab_eliminadas:
                     df_e = df_comp_filtrado[df_comp_filtrado['Situación'] == '❌ ELIMINADA']
-                    st.dataframe(df_e[cols_mostrar], use_container_width=True, height=500)
+                    st.dataframe(df_e[cols_mostrar], width='stretch', height=500)
                     st.caption(f"Total: {len(df_e)} plazas eliminadas")
 
                 with sub_tab_cambios:
                     df_c = df_comp_filtrado[df_comp_filtrado['Situación'] == '🔄 CAMBIO OCUPANTE']
-                    st.dataframe(df_c[cols_mostrar], use_container_width=True, height=500)
+                    st.dataframe(df_c[cols_mostrar], width='stretch', height=500)
                     st.caption(f"Total: {len(df_c)} plazas con cambio de ocupante")
 
                 with sub_tab_dot:
                     df_d = df_comp_filtrado[df_comp_filtrado['Situación'] == '💰 CAMBIO DOTACIÓN']
-                    st.dataframe(df_d[cols_mostrar], use_container_width=True, height=500)
+                    st.dataframe(df_d[cols_mostrar], width='stretch', height=500)
                     st.caption(f"Total: {len(df_d)} plazas con cambio de dotación")
 
                 with sub_tab_ambos:
                     df_ab = df_comp_filtrado[df_comp_filtrado['Situación'] == '🔄 CAMBIO OCUPANTE + DOTACIÓN']
-                    st.dataframe(df_ab[cols_mostrar], use_container_width=True, height=500)
+                    st.dataframe(df_ab[cols_mostrar], width='stretch', height=500)
                     st.caption(f"Total: {len(df_ab)} plazas con cambio de ocupante y dotación")
 
                 # ── Tab PDF ANTERIOR (tabla individual) ───────────────────────
@@ -713,7 +713,7 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
 
                     st.dataframe(
                         df_f[['Código','Denominación','Grupo','Cuerpo','Provincia','Dotación','Estado_Plaza','Ocupante']],
-                        use_container_width=True, height=500
+                        width='stretch', height=500
                     )
                     st.caption(f"Mostrando {len(df_f)} de {len(df_old)} plazas")
 
@@ -748,7 +748,7 @@ if st.session_state.comparacion_ejecutada and st.session_state.archivos_procesad
 
                     st.dataframe(
                         df_f[['Código','Denominación','Grupo','Cuerpo','Provincia','Dotación','Estado_Plaza','Ocupante']],
-                        use_container_width=True, height=500
+                        width='stretch', height=500
                     )
                     st.caption(f"Mostrando {len(df_f)} de {len(df_new)} plazas")
 
